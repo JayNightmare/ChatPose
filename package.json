@@ -1,0 +1,46 @@
+{
+  "version": "1.0.0",
+  "name": "chat-pose",
+  "displayName": "Chat Pose",
+  "description": "P2P Chat Room with end to end encryption and file sharing",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/main.ts",
+    "start": "node index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "format": "prettier --write .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist",
+    "security:audit": "npm audit --audit-level=moderate"
+  },
+  "dependencies": {
+    "@libp2p/mdns": "^12.0.25",
+    "@libp2p/mplex": "^12.0.25",
+    "@libp2p/noise": "^1.0.1",
+    "@libp2p/tcp": "^11.0.22",
+    "blessed": "^0.1.81",
+    "dotenv": "^16.6.1",
+    "libp2p": "^3.3.4",
+    "mysql2": "^3.14.3",
+    "mssql": "^12.1.0",
+    "uint8arrays": "^5.1.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/blessed": "^0.1.25",
+    "@types/mssql": "^9.1.8",
+    "@types/node": "^24.2.1",
+    "@typescript-eslint/eslint-plugin": "^8.41.0",
+    "@typescript-eslint/parser": "^8.41.0",
+    "eslint": "^9.33.0",
+    "prettier": "^3.6.2",
+    "rimraf": "^6.0.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
