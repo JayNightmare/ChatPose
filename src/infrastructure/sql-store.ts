@@ -2,76 +2,83 @@ import mysql, { type Pool, type PoolOptions, type RowDataPacket } from 'mysql2/p
 import sql from 'mssql';
 
 type PersistSignupInput = {
-    email: string;
-    fingerprint: string;
-    traitsHash: string;
-    encryptedTraits: string;
+  email: string;
+  fingerprint: string;
+  traitsHash: string;
+  encryptedTraits: string;
 };
 
 type PersistMessageInput = {
-    sessionId: string;
-    fromPeer: string;
-    toPeer: string;
-    cipherText: string;
-    nonce: string;
-    signature: string;
-    replayToken: string;
-    timestamp: string;
+  sessionId: string;
+  fromPeer: string;
+  toPeer: string;
+  cipherText: string;
+  nonce: string;
+  signature: string;
+  replayToken: string;
+  timestamp: string;
+};
+
+type SignupLookupResult = {
+  email: string;
+  fingerprint: string;
+  traitsHash: string;
+  encryptedTraits: string;
 };
 
 export type DbConfig =
-    | {
-        dialect: 'mssql';
-        config: sql.config;
-    }
-    | {
-        dialect: 'mysql';
-        config: PoolOptions;
-    };
+  | {
+    dialect: 'mssql';
+    config: sql.config;
+  }
+  | {
+    dialect: 'mysql';
+    config: PoolOptions;
+  };
 
 export class SqlStore {
-    private mssqlPool: sql.ConnectionPool | null = null;
-    private mysqlPool: Pool | null = null;
-    private dialect: 'mssql' | 'mysql' | null = null;
+  private mssqlPool: sql.ConnectionPool | null = null;
+  private mysqlPool: Pool | null = null;
+  private dialect: 'mssql' | 'mysql' | null = null;
 
-    public async connect(dbConfig: DbConfig): Promise<void> {
-        if (this.mssqlPool || this.mysqlPool) {
-            return;
-        }
-
-        this.dialect = dbConfig.dialect;
-
-        if (dbConfig.dialect === 'mssql') {
-            this.mssqlPool = await new sql.ConnectionPool(dbConfig.config).connect();
-            return;
-        }
-
-        this.mysqlPool = mysql.createPool(dbConfig.config);
-        await this.mysqlPool.query('SELECT 1');
+  public async connect(dbConfig: DbConfig): Promise<void> {
+    if (this.mssqlPool || this.mysqlPool) {
+      return;
     }
 
-    public async disconnect(): Promise<void> {
-        if (this.mssqlPool) {
-            await this.mssqlPool.close();
-            this.mssqlPool = null;
-        }
+    this.dialect = dbConfig.dialect;
 
-        if (this.mysqlPool) {
-            await this.mysqlPool.end();
-            this.mysqlPool = null;
-        }
-
-        this.dialect = null;
+    if (dbConfig.dialect === 'mssql') {
+      this.mssqlPool = await new sql.ConnectionPool(dbConfig.config).connect();
+      return;
     }
 
-    public async initSchema(): Promise<void> {
-        if (!this.dialect) {
-            throw new Error('SQL connection has not been initialized.');
-        }
+    this.mysqlPool = mysql.createPool(dbConfig.config);
+    await this.mysqlPool.query('SELECT 1');
+  }
 
-        if (this.dialect === 'mssql') {
-            const pool = this.requireMssqlPool();
-            await pool.request().batch(`
+  public async disconnect(): Promise<void> {
+    if (this.mssqlPool) {
+      await this.mssqlPool.close();
+      this.mssqlPool = null;
+    }
+
+    if (this.mysqlPool) {
+      await this.mysqlPool.end();
+      this.mysqlPool = null;
+    }
+
+    this.dialect = null;
+  }
+
+  public async initSchema(): Promise<void> {
+    if (!this.dialect) {
+      throw new Error('SQL connection has not been initialized.');
+    }
+
+    if (this.dialect === 'mssql') {
+      const pool = this.requireMssqlPool();
+      await pool.request().batch(`
         IF OBJECT_ID('dbo.users', 'U') IS NULL
         CREATE TABLE dbo.users (
           user_id UNIQUEIDENTIFIER DEFAULT NEWID() PRIMARY KEY,
@@ -104,12 +111,12 @@ export class SqlStore {
           CONSTRAINT FK_messages_session FOREIGN KEY (session_id) REFERENCES dbo.sessions(session_id)
         );
       `);
-            return;
-        }
+      return;
+    }
 
-        const pool = this.requireMySqlPool();
+    const pool = this.requireMySqlPool();
 
-        await pool.query(`
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         user_id CHAR(36) NOT NULL PRIMARY KEY,
         email VARCHAR(320) NOT NULL UNIQUE,
@@ -120,7 +127,7 @@ export class SqlStore {
       )
     `);
 
-        await pool.query(`
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id VARCHAR(128) NOT NULL PRIMARY KEY,
         peer_a VARCHAR(256) NOT NULL,
@@ -129,7 +136,7 @@ export class SqlStore {
       )
     `);
 
-        await pool.query(`
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         message_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
         session_id VARCHAR(128) NOT NULL,
@@ -143,22 +150,22 @@ export class SqlStore {
         CONSTRAINT fk_messages_session FOREIGN KEY (session_id) REFERENCES sessions(session_id)
       )
     `);
+  }
+
+  public async persistSignup(data: PersistSignupInput): Promise<void> {
+    if (!this.dialect) {
+      return;
     }
 
-    public async persistSignup(data: PersistSignupInput): Promise<void> {
-        if (!this.dialect) {
-            return;
-        }
-
-        if (this.dialect === 'mssql') {
-            const pool = this.requireMssqlPool();
-            await pool
-                .request()
-                .input('email', sql.NVarChar(320), data.email)
-                .input('fingerprint', sql.Char(64), data.fingerprint)
-                .input('traitsHash', sql.Char(64), data.traitsHash)
-                .input('encryptedTraits', sql.VarBinary(sql.MAX), Buffer.from(data.encryptedTraits, 'base64'))
-                .query(`
+    if (this.dialect === 'mssql') {
+      const pool = this.requireMssqlPool();
+      await pool
+        .request()
+        .input('email', sql.NVarChar(320), data.email)
+        .input('fingerprint', sql.Char(64), data.fingerprint)
+        .input('traitsHash', sql.Char(64), data.traitsHash)
+        .input('encryptedTraits', sql.VarBinary(sql.MAX), Buffer.from(data.encryptedTraits, 'base64'))
+        .query(`
           MERGE dbo.users AS target
           USING (SELECT @email AS email) AS source
           ON target.email = source.email
@@ -171,12 +178,12 @@ export class SqlStore {
             INSERT (email, fingerprint, traits_hash, encrypted_traits)
             VALUES (@email, @fingerprint, @traitsHash, @encryptedTraits);
         `);
-            return;
-        }
+      return;
+    }
 
-        const pool = this.requireMySqlPool();
-        await pool.execute(
-            `
+    const pool = this.requireMySqlPool();
+    await pool.execute(
+      `
         INSERT INTO users (user_id, email, fingerprint, traits_hash, encrypted_traits)
         VALUES (UUID(), ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
@@ -184,29 +191,93 @@ export class SqlStore {
           traits_hash = VALUES(traits_hash),
           encrypted_traits = VALUES(encrypted_traits)
       `,
-            [data.email, data.fingerprint, data.traitsHash, Buffer.from(data.encryptedTraits, 'base64')]
-        );
+      [data.email, data.fingerprint, data.traitsHash, Buffer.from(data.encryptedTraits, 'base64')]
+    );
+  }
+
+  public async getSignupByEmail(email: string): Promise<SignupLookupResult | null> {
+    if (!this.dialect) {
+      return null;
     }
 
-    public async ensureSessionParticipants(
-        sessionId: string,
-        localPeerId: string,
-        remotePeerId: string
-    ): Promise<void> {
-        if (!this.dialect) {
-            return;
-        }
+    if (this.dialect === 'mssql') {
+      const pool = this.requireMssqlPool();
+      const result = await pool
+        .request()
+        .input('email', sql.NVarChar(320), email)
+        .query<{
+          email: string;
+          fingerprint: string;
+          traits_hash: string;
+          encrypted_traits: Buffer;
+        }>(`
+                    SELECT TOP 1 email, fingerprint, traits_hash, encrypted_traits
+                    FROM dbo.users
+                    WHERE email = @email
+                `);
 
-        const [peerA, peerB] = [localPeerId, remotePeerId].sort((a, b) => a.localeCompare(b));
+      if (result.recordset.length === 0) {
+        return null;
+      }
 
-        if (this.dialect === 'mssql') {
-            const pool = this.requireMssqlPool();
-            await pool
-                .request()
-                .input('sessionId', sql.NVarChar(128), sessionId)
-                .input('peerA', sql.NVarChar(256), peerA)
-                .input('peerB', sql.NVarChar(256), peerB)
-                .query(`
+      const row = result.recordset[0];
+      return {
+        email: row.email,
+        fingerprint: row.fingerprint,
+        traitsHash: row.traits_hash,
+        encryptedTraits: row.encrypted_traits.toString('base64')
+      };
+    }
+
+    const pool = this.requireMySqlPool();
+    const [rows] = await pool.execute<RowDataPacket[]>(
+      `
+                SELECT email, fingerprint, traits_hash, encrypted_traits
+                FROM users
+                WHERE email = ?
+                LIMIT 1
+            `,
+      [email]
+    );
+
+    if (rows.length === 0) {
+      return null;
+    }
+
+    const row = rows[0] as RowDataPacket & {
+      email: string;
+      fingerprint: string;
+      traits_hash: string;
+      encrypted_traits: Buffer;
+    };
+
+    return {
+      email: row.email,
+      fingerprint: row.fingerprint,
+      traitsHash: row.traits_hash,
+      encryptedTraits: row.encrypted_traits.toString('base64')
+    };
+  }
+
+  public async ensureSessionParticipants(
+    sessionId: string,
+    localPeerId: string,
+    remotePeerId: string
+  ): Promise<void> {
+    if (!this.dialect) {
+      return;
+    }
+
+    const [peerA, peerB] = [localPeerId, remotePeerId].sort((a, b) => a.localeCompare(b));
+
+    if (this.dialect === 'mssql') {
+      const pool = this.requireMssqlPool();
+      await pool
+        .request()
+        .input('sessionId', sql.NVarChar(128), sessionId)
+        .input('peerA', sql.NVarChar(256), peerA)
+        .input('peerB', sql.NVarChar(256), peerB)
+        .query(`
           MERGE dbo.sessions AS target
           USING (SELECT @sessionId AS session_id) AS source
           ON target.session_id = source.session_id
@@ -218,40 +289,40 @@ export class SqlStore {
             INSERT (session_id, peer_a, peer_b)
             VALUES (@sessionId, @peerA, @peerB);
         `);
-            return;
-        }
+      return;
+    }
 
-        const pool = this.requireMySqlPool();
-        await pool.execute(
-            `
+    const pool = this.requireMySqlPool();
+    await pool.execute(
+      `
         INSERT INTO sessions (session_id, peer_a, peer_b)
         VALUES (?, ?, ?)
         ON DUPLICATE KEY UPDATE
           peer_a = VALUES(peer_a),
           peer_b = VALUES(peer_b)
       `,
-            [sessionId, peerA, peerB]
-        );
+      [sessionId, peerA, peerB]
+    );
+  }
+
+  public async persistEncryptedMessage(data: PersistMessageInput): Promise<void> {
+    if (!this.dialect) {
+      return;
     }
 
-    public async persistEncryptedMessage(data: PersistMessageInput): Promise<void> {
-        if (!this.dialect) {
-            return;
-        }
-
-        if (this.dialect === 'mssql') {
-            const pool = this.requireMssqlPool();
-            await pool
-                .request()
-                .input('sessionId', sql.NVarChar(128), data.sessionId)
-                .input('fromPeer', sql.NVarChar(256), data.fromPeer)
-                .input('toPeer', sql.NVarChar(256), data.toPeer)
-                .input('cipherText', sql.VarBinary(sql.MAX), Buffer.from(data.cipherText, 'base64'))
-                .input('nonce', sql.VarBinary(256), Buffer.from(data.nonce, 'base64'))
-                .input('signature', sql.NVarChar(512), data.signature)
-                .input('replayToken', sql.NVarChar(128), data.replayToken)
-                .input('createdAt', sql.DateTime2, new Date(data.timestamp))
-                .query(`
+    if (this.dialect === 'mssql') {
+      const pool = this.requireMssqlPool();
+      await pool
+        .request()
+        .input('sessionId', sql.NVarChar(128), data.sessionId)
+        .input('fromPeer', sql.NVarChar(256), data.fromPeer)
+        .input('toPeer', sql.NVarChar(256), data.toPeer)
+        .input('cipherText', sql.VarBinary(sql.MAX), Buffer.from(data.cipherText, 'base64'))
+        .input('nonce', sql.VarBinary(256), Buffer.from(data.nonce, 'base64'))
+        .input('signature', sql.NVarChar(512), data.signature)
+        .input('replayToken', sql.NVarChar(128), data.replayToken)
+        .input('createdAt', sql.DateTime2, new Date(data.timestamp))
+        .query(`
           IF NOT EXISTS (
             SELECT 1
             FROM dbo.sessions
@@ -265,27 +336,27 @@ export class SqlStore {
           INSERT INTO dbo.messages (session_id, from_peer, to_peer, cipher_text, nonce, signature, replay_token, created_at)
           VALUES (@sessionId, @fromPeer, @toPeer, @cipherText, @nonce, @signature, @replayToken, @createdAt);
         `);
-            return;
-        }
+      return;
+    }
 
-        const pool = this.requireMySqlPool();
-        const [rows] = await pool.execute<RowDataPacket[]>(
-            `
+    const pool = this.requireMySqlPool();
+    const [rows] = await pool.execute<RowDataPacket[]>(
+      `
         SELECT 1 AS ok
         FROM sessions
         WHERE session_id = ?
           AND ((peer_a = ? AND peer_b = ?) OR (peer_a = ? AND peer_b = ?))
         LIMIT 1
       `,
-            [data.sessionId, data.fromPeer, data.toPeer, data.toPeer, data.fromPeer]
-        );
+      [data.sessionId, data.fromPeer, data.toPeer, data.toPeer, data.fromPeer]
+    );
 
-        if (rows.length === 0) {
-            throw new Error('Session participants mismatch or session not initialized.');
-        }
+    if (rows.length === 0) {
+      throw new Error('Session participants mismatch or session not initialized.');
+    }
 
-        await pool.execute(
-            `
+    await pool.execute(
+      `
         INSERT INTO messages (
           session_id,
           from_peer,
@@ -298,30 +369,30 @@ export class SqlStore {
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `,
-            [
-                data.sessionId,
-                data.fromPeer,
-                data.toPeer,
-                Buffer.from(data.cipherText, 'base64'),
-                Buffer.from(data.nonce, 'base64'),
-                data.signature,
-                data.replayToken,
-                new Date(data.timestamp)
-            ]
-        );
-    }
+      [
+        data.sessionId,
+        data.fromPeer,
+        data.toPeer,
+        Buffer.from(data.cipherText, 'base64'),
+        Buffer.from(data.nonce, 'base64'),
+        data.signature,
+        data.replayToken,
+        new Date(data.timestamp)
+      ]
+    );
+  }
 
-    private requireMssqlPool(): sql.ConnectionPool {
-        if (!this.mssqlPool) {
-            throw new Error('MSSQL pool is not initialized.');
-        }
-        return this.mssqlPool;
+  private requireMssqlPool(): sql.ConnectionPool {
+    if (!this.mssqlPool) {
+      throw new Error('MSSQL pool is not initialized.');
     }
+    return this.mssqlPool;
+  }
 
-    private requireMySqlPool(): Pool {
-        if (!this.mysqlPool) {
-            throw new Error('MySQL pool is not initialized.');
-        }
-        return this.mysqlPool;
+  private requireMySqlPool(): Pool {
+    if (!this.mysqlPool) {
+      throw new Error('MySQL pool is not initialized.');
     }
+    return this.mysqlPool;
+  }
 }

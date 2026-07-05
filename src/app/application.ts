@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import { env, hasSqlConfig } from '../config/env';
 import { CryptoService } from '../domain/crypto-service';
+import { EmailValidationService } from '../domain/email-validation-service';
 import { FingerprintService } from '../domain/fingerprint-service';
 import { SessionGuard } from '../domain/session-guard';
 import type { ChatMessage, MessageEnvelope, ScreenName, SignupResult } from '../domain/models';
@@ -10,6 +11,7 @@ import { SqlStore } from '../infrastructure/sql-store';
 import type { DbConfig } from '../infrastructure/sql-store';
 import { TerminalUi } from '../ui/terminal-ui';
 import { readFile } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
 
 type AppState = {
   currentScreen: ScreenName;
@@ -18,28 +20,55 @@ type AppState = {
   signedUpIdentity: SignupResult | null;
   activeSessionKey: Buffer | null;
   connectedPeer: string | null;
+  accountEmail: string | null;
+  persistenceMode: 'connected' | 'ephemeral';
 };
 
 const HELP_TEXT = [
   'Commands:',
   '  help',
   '  goto login|signup|message-board',
+  '  setup <email>',
   '  signup <email>',
-  '  login <fingerprint>',
+  '  login <email> <fingerprint>',
   '  connect <peer-id>',
   '  disconnect',
   '  send <message>',
   '  sendfile <path>',
+  '  peer',
   '  show fingerprint',
+  '  exit',
   'Hotkeys:',
   '  F1 -> login',
   '  F2 -> signup',
-  '  F3 -> message-board'
+  '  F3 -> message-board',
+  'Editor:',
+  '  Up/Down -> command history',
+  '  Tab -> command completion'
 ].join('\n');
 
 export class Application {
+  private readonly commandNames = [
+    'help',
+    'goto',
+    'setup',
+    'signup',
+    'login',
+    'connect',
+    'disconnect',
+    'send',
+    'sendfile',
+    'peer',
+    'show',
+    'exit'
+  ];
+
+  private readonly gotoTargets: ScreenName[] = ['login', 'signup', 'message-board'];
+  private readonly showTargets = ['fingerprint'];
+
   private readonly ui = new TerminalUi();
   private readonly fingerprintService = new FingerprintService(env.APP_MASTER_SECRET);
+  private readonly emailValidationService = new EmailValidationService(env.EMAIL_CHECK_MODE);
   private readonly cryptoService = new CryptoService();
   private readonly p2pService = new Libp2pService();
   private readonly sessionGuard = new SessionGuard();
@@ -50,7 +79,9 @@ export class Application {
     sessionId: randomUUID(),
     signedUpIdentity: null,
     activeSessionKey: null,
-    connectedPeer: null
+    connectedPeer: null,
+    accountEmail: null,
+    persistenceMode: 'ephemeral'
   };
 
   public async start(): Promise<void> {
@@ -62,8 +93,17 @@ export class Application {
     this.addLog(HELP_TEXT);
 
     this.bindKeys();
+    this.ui.onInfo((line) => {
+      this.addLog(line);
+      this.render();
+    });
+    this.ui.onCompletion((input) => this.completeInput(input));
     this.ui.onSubmit((input) => {
-      void this.handleInput(input);
+      void this.handleInput(input).catch((error) => {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.addLog(`Command failed: ${reason}`);
+        this.render();
+      });
     });
 
     this.render();
@@ -94,8 +134,11 @@ export class Application {
       case 'signup':
         await this.handleSignup(rest.join(' '));
         break;
+      case 'setup':
+        await this.handleSetup(rest.join(' '));
+        break;
       case 'login':
-        this.handleLogin(rest.join(' '));
+        await this.handleLogin(rest.join(' '));
         break;
       case 'connect':
         await this.handleConnect(rest.join(' '));
@@ -112,6 +155,12 @@ export class Application {
       case 'show':
         this.handleShow(rest.join(' '));
         break;
+      case 'peer':
+        await this.handlePeer();
+        break;
+      case 'exit':
+        await this.handleExit();
+        return;
       default:
         this.addLog(`Unknown command: ${command}. Type help.`);
         break;
@@ -121,8 +170,7 @@ export class Application {
   }
 
   private handleGoto(screen: string | undefined): void {
-    const allowedScreens: ScreenName[] = ['login', 'signup', 'message-board'];
-    if (!screen || !allowedScreens.includes(screen as ScreenName)) {
+    if (!screen || !this.gotoTargets.includes(screen as ScreenName)) {
       this.addLog('Invalid screen. Use login, signup, or message-board.');
       return;
     }
@@ -131,33 +179,86 @@ export class Application {
   }
 
   private async handleSignup(email: string): Promise<void> {
-    if (!email.includes('@')) {
-      this.addLog('Signup failed. Provide a valid email.');
+    const validation = await this.emailValidationService.validate(email);
+    if (!validation.ok) {
+      this.addLog(validation.message ?? 'Signup failed. Provide a valid email.');
       return;
     }
 
-    const result = this.fingerprintService.createSignupFingerprint(email);
+    if (validation.warning) {
+      this.addLog(validation.warning);
+    }
+
+    const result = this.fingerprintService.createSignupFingerprint(validation.normalizedEmail as string);
     this.state.signedUpIdentity = result;
     this.addLog(`Signup successful for ${result.email}.`);
     this.addLog(`Fingerprint issued (store securely): ${result.fingerprint}`);
 
-    await this.sqlStore.persistSignup(result);
+    try {
+      await this.sqlStore.persistSignup(result);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.addLog(`Signup persisted locally only. DB write failed: ${reason}`);
+    }
     this.switchScreen('login');
   }
 
-  private handleLogin(fingerprint: string): void {
+  private async handleSetup(email: string): Promise<void> {
+    await this.handleSignup(email);
     if (!this.state.signedUpIdentity) {
-      this.addLog('Login blocked. You must complete signup first in this node session.');
       return;
     }
 
-    const derived = this.fingerprintService.deriveBoundFingerprint(this.state.signedUpIdentity.email);
-    if (fingerprint !== this.state.signedUpIdentity.fingerprint || fingerprint !== derived) {
+    await this.handleLogin(`${this.state.signedUpIdentity.email} ${this.state.signedUpIdentity.fingerprint}`);
+    this.addLog('Account setup pipeline complete.');
+  }
+
+  private async handleLogin(input: string): Promise<void> {
+    const parts = input.trim().split(/\s+/).filter(Boolean);
+    if (parts.length < 2) {
+      this.addLog('Login requires: login <email> <fingerprint>');
+      return;
+    }
+
+    const email = parts[0].toLowerCase();
+    const fingerprint = parts.slice(1).join(' ');
+
+    let expectedFingerprint =
+      this.state.signedUpIdentity && this.state.signedUpIdentity.email === email
+        ? this.state.signedUpIdentity.fingerprint
+        : null;
+
+    if (!expectedFingerprint) {
+      let stored: SignupResult | null = null;
+      try {
+        stored = await this.sqlStore.getSignupByEmail(email);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.addLog(`Account lookup failed: ${reason}`);
+      }
+
+      if (!stored) {
+        this.addLog('Login blocked. Account not found; run signup or setup first.');
+        return;
+      }
+
+      expectedFingerprint = stored.fingerprint;
+      this.state.signedUpIdentity = {
+        email: stored.email,
+        fingerprint: stored.fingerprint,
+        traitsHash: stored.traitsHash,
+        encryptedTraits: stored.encryptedTraits
+      };
+    }
+
+    const derived = this.fingerprintService.deriveBoundFingerprint(email);
+    if (fingerprint !== expectedFingerprint || fingerprint !== derived) {
       this.addLog('Strict fingerprint gate rejected this login attempt.');
       return;
     }
 
     this.state.activeSessionKey = this.cryptoService.createSessionKey();
+    this.state.accountEmail = email;
     this.addLog('Login accepted. Session key issued in-memory only.');
     this.switchScreen('message-board');
   }
@@ -283,6 +384,154 @@ export class Application {
     }
   }
 
+  private async handlePeer(): Promise<void> {
+    const peerId = this.p2pService.getPeerId();
+    this.addLog(`Local peer id: ${peerId}`);
+  }
+
+  private completeInput(input: string): { value: string; suggestionLine?: string } | null {
+    const hasTrailingSpace = /\s$/.test(input);
+    const trimmed = input.trim();
+
+    if (!trimmed) {
+      return {
+        value: input,
+        suggestionLine: `Completions: ${this.commandNames.join(', ')}`
+      };
+    }
+
+    const parts = trimmed.split(/\s+/);
+    if (parts.length === 1 && !hasTrailingSpace) {
+      return this.completeToken(input, parts[0], this.commandNames);
+    }
+
+    const command = parts[0].toLowerCase();
+    const token = hasTrailingSpace ? '' : parts[parts.length - 1];
+
+    if (command === 'goto') {
+      return this.completeToken(input, token, this.gotoTargets);
+    }
+
+    if (command === 'show') {
+      return this.completeToken(input, token, this.showTargets);
+    }
+
+    return null;
+  }
+
+  private completeToken(input: string, token: string, candidates: string[]): { value: string; suggestionLine?: string } | null {
+    const normalizedToken = token.toLowerCase();
+    let matches = candidates.filter((candidate) => candidate.startsWith(normalizedToken));
+    if (matches.length === 0 && normalizedToken) {
+      matches = this.findClosestMatches(normalizedToken, candidates);
+    }
+
+    if (matches.length === 0) {
+      return null;
+    }
+
+    if (matches.length === 1) {
+      return {
+        value: this.replaceLastToken(input, matches[0])
+      };
+    }
+
+    const commonPrefix = this.findCommonPrefix(matches);
+    if (commonPrefix.length > token.length) {
+      return {
+        value: this.replaceLastToken(input, commonPrefix),
+        suggestionLine: `Matches: ${matches.join(', ')}`
+      };
+    }
+
+    return {
+      value: input,
+      suggestionLine: `Matches: ${matches.join(', ')}`
+    };
+  }
+
+  private findClosestMatches(token: string, candidates: string[]): string[] {
+    const scored = candidates.map((candidate) => ({
+      candidate,
+      distance: this.levenshteinDistance(token, candidate)
+    }));
+
+    const minDistance = Math.min(...scored.map((item) => item.distance));
+    const maxAcceptedDistance = Math.max(2, Math.floor(token.length / 2));
+    if (minDistance > maxAcceptedDistance) {
+      return [];
+    }
+
+    return scored
+      .filter((item) => item.distance === minDistance)
+      .map((item) => item.candidate)
+      .sort((a, b) => a.localeCompare(b));
+  }
+
+  private levenshteinDistance(a: string, b: string): number {
+    if (a === b) {
+      return 0;
+    }
+
+    const rows = a.length + 1;
+    const cols = b.length + 1;
+    const matrix: number[][] = Array.from({ length: rows }, () => Array<number>(cols).fill(0));
+
+    for (let i = 0; i < rows; i += 1) {
+      matrix[i][0] = i;
+    }
+    for (let j = 0; j < cols; j += 1) {
+      matrix[0][j] = j;
+    }
+
+    for (let i = 1; i < rows; i += 1) {
+      for (let j = 1; j < cols; j += 1) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j - 1] + cost
+        );
+      }
+    }
+
+    return matrix[rows - 1][cols - 1];
+  }
+
+  private replaceLastToken(input: string, replacement: string): string {
+    if (!input.trim()) {
+      return `${replacement} `;
+    }
+
+    if (!input.includes(' ')) {
+      return `${replacement} `;
+    }
+
+    if (/\s$/.test(input)) {
+      return `${input}${replacement} `;
+    }
+
+    const lastSpace = input.lastIndexOf(' ');
+    return `${input.slice(0, lastSpace + 1)}${replacement} `;
+  }
+
+  private findCommonPrefix(values: string[]): string {
+    if (values.length === 0) {
+      return '';
+    }
+
+    let prefix = values[0];
+    for (const value of values.slice(1)) {
+      while (!value.startsWith(prefix) && prefix.length > 0) {
+        prefix = prefix.slice(0, -1);
+      }
+      if (!prefix) {
+        break;
+      }
+    }
+    return prefix;
+  }
+
   private async persistEnvelope(envelope: MessageEnvelope, message: ChatMessage): Promise<void> {
     await this.sqlStore.persistEncryptedMessage({
       sessionId: message.sessionId,
@@ -294,6 +543,15 @@ export class Application {
       replayToken: envelope.replayToken,
       timestamp: envelope.timestamp
     });
+  }
+
+  private async handleExit(): Promise<void> {
+    this.addLog('Shutting down ChatPose CLI...');
+    this.render();
+
+    await this.p2pService.stop();
+    await this.sqlStore.disconnect();
+    process.exit(0);
   }
 
   private switchScreen(screen: ScreenName): void {
@@ -312,16 +570,18 @@ export class Application {
   private render(): void {
     const prompt =
       this.state.currentScreen === 'login'
-        ? 'login <fingerprint>'
+        ? 'login <email> <fingerprint>'
         : this.state.currentScreen === 'signup'
-          ? 'signup <email>'
+          ? 'setup <email> or signup <email>'
           : 'connect <peer-id> then send <message>';
 
     this.ui.render({
       currentScreen: this.state.currentScreen,
       logLines: this.state.logs,
       prompt,
-      peerId: this.p2pService.getPeerId()
+      peerId: this.p2pService.getPeerId(),
+      persistenceMode: this.state.persistenceMode,
+      accountEmail: this.state.accountEmail
     });
   }
 
@@ -330,6 +590,35 @@ export class Application {
       this.addLog('SQL not configured. Running in ephemeral mode (no persistence).');
       return;
     }
+
+    const mysqlSslConfig = (() => {
+      if (!env.SQL_SSL) {
+        return undefined;
+      }
+
+      const sslConfig: {
+        rejectUnauthorized: boolean;
+        ca?: string;
+        cert?: string;
+        key?: string;
+      } = {
+        rejectUnauthorized: env.SQL_SSL_REJECT_UNAUTHORIZED
+      };
+
+      if (env.SQL_SSL_CA_FILE && existsSync(env.SQL_SSL_CA_FILE)) {
+        sslConfig.ca = readFileSync(env.SQL_SSL_CA_FILE, 'utf8');
+      }
+
+      if (env.SQL_SSL_CERT_FILE && existsSync(env.SQL_SSL_CERT_FILE)) {
+        sslConfig.cert = readFileSync(env.SQL_SSL_CERT_FILE, 'utf8');
+      }
+
+      if (env.SQL_SSL_KEY_FILE && existsSync(env.SQL_SSL_KEY_FILE)) {
+        sslConfig.key = readFileSync(env.SQL_SSL_KEY_FILE, 'utf8');
+      }
+
+      return sslConfig;
+    })();
 
     const dbConfig: DbConfig =
       env.SQL_DIALECT === 'mysql'
@@ -343,7 +632,7 @@ export class Application {
             port: env.SQL_PORT,
             waitForConnections: true,
             connectionLimit: 5,
-            ssl: env.SQL_SSL ? {} : undefined
+            ssl: mysqlSslConfig
           }
         }
         : {
@@ -366,8 +655,17 @@ export class Application {
           }
         };
 
-    await this.sqlStore.connect(dbConfig);
-    await this.sqlStore.initSchema();
-    this.addLog(`SQL persistence initialized using ${env.SQL_DIALECT}.`);
+    try {
+      await this.sqlStore.connect(dbConfig);
+      await this.sqlStore.initSchema();
+      this.state.persistenceMode = 'connected';
+      this.addLog(`SQL persistence initialized using ${env.SQL_DIALECT}.`);
+      this.addLog('Startup mode: connected (persistent account storage enabled).');
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.state.persistenceMode = 'ephemeral';
+      this.addLog(`SQL connection failed. Running in ephemeral mode. Reason: ${reason}`);
+      this.addLog('Startup mode: ephemeral (data is not persisted).');
+    }
   }
 }
